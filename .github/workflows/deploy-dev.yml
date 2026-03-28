@@ -8,16 +8,11 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: foji-worker-dev
-  LAMBDA_FUNCTIONS: >-
-    foji-worker-file-extraction-dev
-    foji-worker-whatsapp-dev
-    foji-worker-analytics-dev
 
 jobs:
   deploy:
     name: Build & Deploy to Dev
     runs-on: ubuntu-latest
-    environment: dev
 
     steps:
       - name: Checkout
@@ -30,9 +25,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Log in to Amazon ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if missing
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || \
+            aws ecr create-repository --repository-name $ECR_REPOSITORY --image-scanning-configuration scanOnPush=true
 
       - name: Build, tag, and push image to ECR
         id: build-image
@@ -40,34 +40,124 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          # Also tag as latest for dev
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-                     $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Update Lambda functions
+      - name: Create or update Lambda functions
         env:
           IMAGE_URI: ${{ steps.build-image.outputs.image }}
         run: |
-          for fn in $LAMBDA_FUNCTIONS; do
-            echo "Updating $fn → $IMAGE_URI"
-            aws lambda update-function-code \
-              --function-name "$fn" \
-              --image-uri "$IMAGE_URI" \
-              --no-cli-pager
+          # Secrets come from SSM at cold start via AWS_SSM_PREFIX
+          # Only non-secret config is set as env vars here
+          COMMON_ENV='{
+            "Variables": {
+              "AWS_SSM_PREFIX": "/foji/dev/worker/",
+              "AWS_S3_BUCKET_NAME": "foji-files-dev",
+              "AWS_DYNAMODB_TABLE": "foji-chats-dev"
+            }
+          }'
+
+          declare -A FUNCTIONS
+          FUNCTIONS[foji-worker-file-extraction-dev]="app.handlers.file_extraction.handler|512|300"
+          FUNCTIONS[foji-worker-whatsapp-dev]="app.handlers.whatsapp.handler|256|30"
+          FUNCTIONS[foji-worker-analytics-dev]="app.handlers.analytics.handler|256|300"
+
+          for fn in "${!FUNCTIONS[@]}"; do
+            IFS='|' read -r handler memory timeout <<< "${FUNCTIONS[$fn]}"
+
+            EXISTS=$(aws lambda get-function --function-name "$fn" 2>/dev/null && echo "yes" || echo "no")
+
+            if [ "$EXISTS" = "no" ]; then
+              echo "Creating Lambda function $fn..."
+              aws lambda create-function \
+                --function-name "$fn" \
+                --package-type Image \
+                --code ImageUri="$IMAGE_URI" \
+                --role "${{ secrets.LAMBDA_EXECUTION_ROLE_ARN }}" \
+                --memory-size "$memory" \
+                --timeout "$timeout" \
+                --environment "$COMMON_ENV" \
+                --image-config '{"Command": ["'"$handler"'"]}' \
+                --no-cli-pager
+            else
+              echo "Updating Lambda function $fn..."
+              aws lambda update-function-code \
+                --function-name "$fn" \
+                --image-uri "$IMAGE_URI" \
+                --no-cli-pager
+
+              aws lambda wait function-updated --function-name "$fn" --no-cli-pager
+
+              aws lambda update-function-configuration \
+                --function-name "$fn" \
+                --memory-size "$memory" \
+                --timeout "$timeout" \
+                --environment "$COMMON_ENV" \
+                --image-config '{"Command": ["'"$handler"'"]}' \
+                --no-cli-pager
+            fi
           done
 
-      - name: Wait for Lambda updates to complete
+      - name: Wait for Lambda updates
         run: |
-          for fn in $LAMBDA_FUNCTIONS; do
+          for fn in foji-worker-file-extraction-dev foji-worker-whatsapp-dev foji-worker-analytics-dev; do
             echo "Waiting for $fn..."
-            aws lambda wait function-updated \
-              --function-name "$fn" \
-              --no-cli-pager
+            aws lambda wait function-updated --function-name "$fn" --no-cli-pager
           done
 
-      - name: Notify success
-        run: echo "✅ Dev deploy complete — image ${{ steps.build-image.outputs.image }}"
+      - name: Ensure SQS triggers exist
+        run: |
+          # File extraction trigger
+          EXISTING=$(aws lambda list-event-source-mappings --function-name foji-worker-file-extraction-dev \
+            --query "EventSourceMappings[?contains(EventSourceArn, 'foji-file-extraction-dev')]" --output text)
+          if [ -z "$EXISTING" ]; then
+            echo "Creating SQS trigger for file extraction..."
+            aws lambda create-event-source-mapping \
+              --function-name foji-worker-file-extraction-dev \
+              --event-source-arn "${{ secrets.DEV_SQS_FILE_EXTRACTION_ARN }}" \
+              --batch-size 1 --no-cli-pager
+          fi
+
+          # WhatsApp trigger
+          EXISTING=$(aws lambda list-event-source-mappings --function-name foji-worker-whatsapp-dev \
+            --query "EventSourceMappings[?contains(EventSourceArn, 'foji-whatsapp-dev')]" --output text)
+          if [ -z "$EXISTING" ]; then
+            echo "Creating SQS trigger for WhatsApp..."
+            aws lambda create-event-source-mapping \
+              --function-name foji-worker-whatsapp-dev \
+              --event-source-arn "${{ secrets.DEV_SQS_WHATSAPP_ARN }}" \
+              --batch-size 1 --no-cli-pager
+          fi
+
+      - name: Ensure EventBridge schedule exists
+        run: |
+          RULE_EXISTS=$(aws events describe-rule --name foji-analytics-dev 2>/dev/null && echo "yes" || echo "no")
+          if [ "$RULE_EXISTS" = "no" ]; then
+            echo "Creating EventBridge rule..."
+            aws events put-rule \
+              --name foji-analytics-dev \
+              --schedule-expression "cron(5 0 * * ? *)" \
+              --state ENABLED
+
+            FN_ARN=$(aws lambda get-function --function-name foji-worker-analytics-dev \
+              --query "Configuration.FunctionArn" --output text)
+
+            aws lambda add-permission \
+              --function-name foji-worker-analytics-dev \
+              --statement-id eventbridge-analytics \
+              --action lambda:InvokeFunction \
+              --principal events.amazonaws.com \
+              --source-arn "arn:aws:events:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):rule/foji-analytics-dev" \
+              2>/dev/null || true
+
+            aws events put-targets \
+              --rule foji-analytics-dev \
+              --targets "Id=analytics,Arn=$FN_ARN"
+          fi
+
+      - name: Summary
+        run: echo "Dev deploy complete — image ${{ steps.build-image.outputs.image }}"
