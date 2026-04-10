@@ -15,12 +15,7 @@ logger = logging.getLogger(__name__)
 
 def _client():
     cfg = get_settings()
-    return boto3.client(
-        "s3",
-        region_name=cfg.aws_region,
-        aws_access_key_id=cfg.aws_access_key_id or None,
-        aws_secret_access_key=cfg.aws_secret_access_key or None,
-    )
+    return boto3.client("s3", region_name=cfg.aws_region)
 
 
 def download_to_tmp(s3_key: str) -> str:
