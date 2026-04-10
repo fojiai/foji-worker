@@ -2,6 +2,7 @@ import os
 from functools import lru_cache
 
 import boto3
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,7 +34,7 @@ class Settings(BaseSettings):
 
     database_url: str = ""
     aws_region: str = "us-east-1"
-    aws_s3_bucket: str = ""
+    aws_s3_bucket: str = Field(default="", validation_alias=AliasChoices("aws_s3_bucket", "aws_s3_bucket_name"))
     aws_dynamodb_table: str = "foji-chats-dev"
     foji_ai_api_url: str = "http://localhost:8000"
     internal_api_key: str = ""
