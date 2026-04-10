@@ -45,7 +45,8 @@ def handler(event: dict, context) -> dict:
             _process_message(body)
             results.append({"message_id": body.get("message_id"), "status": "ok"})
         except Exception as exc:
-            logger.exception("Unhandled error processing WhatsApp record: %s", record)
+            msg_id = record.get("messageId", "unknown")
+            logger.exception("Failed to process WhatsApp SQS record messageId=%s", msg_id)
             results.append({"error": str(exc)})
     return {"results": results}
 

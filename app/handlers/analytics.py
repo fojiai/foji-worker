@@ -123,7 +123,7 @@ def _scan_dynamo(target_date: date) -> list[dict]:
             break
         kwargs["ExclusiveStartKey"] = last
 
-    logger.info("DynamoDB scan returned %d assistant items for %s", len(items), date_str)
+    logger.debug("DynamoDB scan returned %d assistant items for %s", len(items), date_str)
     return items
 
 
@@ -204,7 +204,7 @@ def _upsert_stats(aggregated: dict[int, dict], target_date: date) -> None:
             )
 
         db.commit()
-        logger.info("Upserted stats for %d companies on %s", len(aggregated), target_date)
+        logger.debug("Upserted stats for %d companies on %s", len(aggregated), target_date)
     except Exception:
         db.rollback()
         raise
