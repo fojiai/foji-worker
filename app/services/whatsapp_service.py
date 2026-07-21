@@ -12,7 +12,9 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_META_BASE = "https://graph.facebook.com/v19.0"
+
+def _meta_base() -> str:
+    return f"https://graph.facebook.com/{get_settings().meta_graph_version}"
 
 
 def _headers() -> dict:
@@ -24,7 +26,7 @@ def _headers() -> dict:
 
 def send_text(phone_number_id: str, to: str, body: str) -> None:
     """Send a plain-text WhatsApp message."""
-    url = f"{_META_BASE}/{phone_number_id}/messages"
+    url = f"{_meta_base()}/{phone_number_id}/messages"
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",

@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     internal_api_key: str = ""
     meta_whatsapp_token: str = ""
     meta_phone_number_id: str = ""
+    meta_graph_version: str = "v25.0"  # Meta Graph API version for Cloud API calls
 
     # Chunking
     chunk_target_tokens: int = 512
