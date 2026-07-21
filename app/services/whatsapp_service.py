@@ -17,15 +17,19 @@ def _meta_base() -> str:
     return f"https://graph.facebook.com/{get_settings().meta_graph_version}"
 
 
-def _headers() -> dict:
+def _headers(token: str | None = None) -> dict:
     return {
-        "Authorization": f"Bearer {get_settings().meta_whatsapp_token}",
+        "Authorization": f"Bearer {token or get_settings().meta_whatsapp_token}",
         "Content-Type": "application/json",
     }
 
 
-def send_text(phone_number_id: str, to: str, body: str) -> None:
-    """Send a plain-text WhatsApp message."""
+def send_text(phone_number_id: str, to: str, body: str, token: str | None = None) -> None:
+    """Send a plain-text WhatsApp message.
+
+    `token` is the tenant's Meta Cloud API token; falls back to the global
+    META_WHATSAPP_TOKEN when the agent has no per-tenant token configured.
+    """
     url = f"{_meta_base()}/{phone_number_id}/messages"
     payload = {
         "messaging_product": "whatsapp",
@@ -35,7 +39,7 @@ def send_text(phone_number_id: str, to: str, body: str) -> None:
         "text": {"preview_url": False, "body": body},
     }
     with httpx.Client(timeout=15) as client:
-        resp = client.post(url, json=payload, headers=_headers())
+        resp = client.post(url, json=payload, headers=_headers(token))
     if resp.status_code not in (200, 201):
         logger.error(
             "WhatsApp send failed: status=%d body=%s",

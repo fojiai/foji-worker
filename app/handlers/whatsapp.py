@@ -29,6 +29,7 @@ import httpx
 
 from app.core.config import get_settings
 from app.core.database import get_session
+from app.core.encryption import decrypt
 from app.services.agent_resolver import resolve_agent_by_phone
 from app.services.whatsapp_service import parse_inbound, send_text
 
@@ -74,7 +75,19 @@ def _process_message(msg: dict) -> None:
             return
 
         reply = _call_ai_api(agent.agent_token, sender, text)
-        send_text(phone_number_id, sender, reply)
+
+        # Use the agent's own Meta token if configured; otherwise fall back to the
+        # global token. Decryption failure must not drop the message — fall back.
+        token = None
+        if agent.whats_app_access_token_encrypted:
+            try:
+                token = decrypt(agent.whats_app_access_token_encrypted)
+            except Exception:
+                logger.exception(
+                    "Failed to decrypt WhatsApp token for agent_id=%d — falling back to global token",
+                    agent.id,
+                )
+        send_text(phone_number_id, sender, reply, token=token)
 
         logger.info(
             "WhatsApp handled: agent_id=%d sender=%s message_id=%s",
