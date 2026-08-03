@@ -58,6 +58,7 @@ def _process_message(msg: dict) -> None:
     sender = msg.get("from", "")
     text = msg.get("text")
     message_id = msg.get("message_id", "")
+    profile_name = msg.get("profile_name")
 
     if not text:
         logger.info("Non-text message from %s (id=%s) — skipping", sender, message_id)
@@ -74,7 +75,7 @@ def _process_message(msg: dict) -> None:
             )
             return
 
-        reply = _call_ai_api(agent.agent_token, sender, text)
+        reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
 
         # Use the agent's own Meta token if configured; otherwise fall back to the
         # global token. Decryption failure must not drop the message — fall back.
@@ -99,7 +100,9 @@ def _process_message(msg: dict) -> None:
         db.close()
 
 
-def _call_ai_api(agent_token: str, session_id: str, message: str) -> str:
+def _call_ai_api(
+    agent_token: str, session_id: str, message: str, profile_name: str | None = None
+) -> str:
     """
     Call foji-ai-api's internal WhatsApp endpoint.
 
@@ -112,6 +115,8 @@ def _call_ai_api(agent_token: str, session_id: str, message: str) -> str:
         "agent_token": agent_token,
         "session_id": f"wa:{session_id}",  # prefix to namespace WhatsApp sessions
         "message": message,
+        "sender_phone": session_id,
+        "profile_name": profile_name,
     }
     headers = {"X-Internal-Key": settings.internal_api_key}
 
