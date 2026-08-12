@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     aws_dynamodb_table: str = "foji-chats-dev"
     foji_ai_api_url: str = "http://localhost:8000"
     internal_api_key: str = ""
+    foji_api_base_url: str = "http://localhost:5000"
     meta_whatsapp_token: str = ""
     meta_phone_number_id: str = ""
     meta_graph_version: str = "v25.0"  # Meta Graph API version for Cloud API calls

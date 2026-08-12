@@ -75,6 +75,24 @@ def _process_message(msg: dict) -> None:
             )
             return
 
+        # Inbox mode: a human answers from Foji's shared inbox, so record the
+        # message and stay silent. Auto-replying here would mean the bot and a
+        # team member both answering the same customer.
+        if (agent.whats_app_mode or "Agent") == "Inbox":
+            _record_inbox_message(
+                agent_id=agent.id,
+                phone_number_id=phone_number_id,
+                wa_id=sender,
+                profile_name=profile_name,
+                wam_id=message_id,
+                text=text,
+            )
+            logger.info(
+                "WhatsApp routed to inbox: agent_id=%d sender=%s message_id=%s",
+                agent.id, sender, message_id,
+            )
+            return
+
         reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
 
         # Use the agent's own Meta token if configured; otherwise fall back to the
@@ -131,3 +149,33 @@ def _call_ai_api(
         raise ValueError("AI API returned an empty reply")
 
     return reply
+
+
+def _record_inbox_message(
+    *,
+    agent_id: int,
+    phone_number_id: str,
+    wa_id: str,
+    profile_name: str | None,
+    wam_id: str,
+    text: str,
+) -> None:
+    """
+    Store an inbound message in FojiApi's shared inbox. FojiApi owns the Postgres
+    schema, so the write goes through its internal endpoint rather than direct SQL.
+    """
+    settings = get_settings()
+    url = f"{settings.foji_api_base_url}/api/whatsapp/inbox/internal/inbound"
+    payload = {
+        "agentId": agent_id,
+        "phoneNumberId": phone_number_id,
+        "waId": wa_id,
+        "profileName": profile_name,
+        "wamId": wam_id,
+        "text": text,
+    }
+    headers = {"X-Internal-Key": settings.internal_api_key}
+
+    with httpx.Client(timeout=10) as client:
+        resp = client.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
