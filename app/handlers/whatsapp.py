@@ -24,6 +24,7 @@ Flow:
 
 import json
 import logging
+import mimetypes
 
 import httpx
 
@@ -31,7 +32,8 @@ from app.core.config import get_settings
 from app.core.database import get_session
 from app.core.encryption import decrypt
 from app.services.agent_resolver import resolve_agent_by_phone
-from app.services.whatsapp_service import parse_inbound, send_text
+from app.services.whatsapp_service import fetch_media, parse_inbound, send_text
+from app.utils.s3 import upload_bytes
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -59,9 +61,14 @@ def _process_message(msg: dict) -> None:
     text = msg.get("text")
     message_id = msg.get("message_id", "")
     profile_name = msg.get("profile_name")
+    message_type = msg.get("message_type") or "text"
+    media_id = msg.get("media_id")
+    media_mime = msg.get("media_mime")
+    media_filename = msg.get("media_filename")
 
-    if not text:
-        logger.info("Non-text message from %s (id=%s) — skipping", sender, message_id)
+    # Text messages need a body; media messages may legitimately have none (no caption).
+    if not text and not media_id:
+        logger.info("Empty message from %s (id=%s) — skipping", sender, message_id)
         return
 
     db = get_session()
@@ -79,13 +86,34 @@ def _process_message(msg: dict) -> None:
         # message and stay silent. Auto-replying here would mean the bot and a
         # team member both answering the same customer.
         if (agent.whats_app_mode or "Agent") == "Inbox":
+            token = _agent_token(agent)
+            media_key = media_content_type = None
+            if media_id:
+                # Meta's media URLs expire in minutes, so keep our own copy.
+                try:
+                    media_key, media_content_type = _store_media(
+                        company_id=agent.company_id,
+                        agent_id=agent.id,
+                        media_id=media_id,
+                        fallback_mime=media_mime,
+                        token=token,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to download WhatsApp media %s — recording without it", media_id
+                    )
+
             _record_inbox_message(
                 agent_id=agent.id,
                 phone_number_id=phone_number_id,
                 wa_id=sender,
                 profile_name=profile_name,
                 wam_id=message_id,
-                text=text,
+                text=text or "",
+                message_type=message_type,
+                media_s3_key=media_key,
+                media_content_type=media_content_type,
+                media_filename=media_filename,
             )
             logger.info(
                 "WhatsApp routed to inbox: agent_id=%d sender=%s message_id=%s",
@@ -93,20 +121,15 @@ def _process_message(msg: dict) -> None:
             )
             return
 
+        if not text:
+            logger.info(
+                "Media message from %s with no caption and agent in AI mode — skipping", sender
+            )
+            return
+
         reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
 
-        # Use the agent's own Meta token if configured; otherwise fall back to the
-        # global token. Decryption failure must not drop the message — fall back.
-        token = None
-        if agent.whats_app_access_token_encrypted:
-            try:
-                token = decrypt(agent.whats_app_access_token_encrypted)
-            except Exception:
-                logger.exception(
-                    "Failed to decrypt WhatsApp token for agent_id=%d — falling back to global token",
-                    agent.id,
-                )
-        send_text(phone_number_id, sender, reply, token=token)
+        send_text(phone_number_id, sender, reply, token=_agent_token(agent))
 
         logger.info(
             "WhatsApp handled: agent_id=%d sender=%s message_id=%s",
@@ -151,6 +174,32 @@ def _call_ai_api(
     return reply
 
 
+def _agent_token(agent) -> str | None:
+    """The agent's own Meta token, or None to fall back to the global one."""
+    if not agent.whats_app_access_token_encrypted:
+        return None
+    try:
+        return decrypt(agent.whats_app_access_token_encrypted)
+    except Exception:
+        logger.exception(
+            "Failed to decrypt WhatsApp token for agent_id=%d — falling back to global token",
+            agent.id,
+        )
+        return None
+
+
+def _store_media(
+    *, company_id: int, agent_id: int, media_id: str, fallback_mime: str | None, token: str | None
+) -> tuple[str, str]:
+    """Download media from Meta and put it in S3. Returns (s3_key, content_type)."""
+    content, mime = fetch_media(media_id, token=token)
+    content_type = mime or fallback_mime or "application/octet-stream"
+    extension = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".bin"
+    key = f"tenant/{company_id}/whatsapp/{agent_id}/{media_id}{extension}"
+    upload_bytes(key, content, content_type)
+    return key, content_type
+
+
 def _record_inbox_message(
     *,
     agent_id: int,
@@ -159,6 +208,10 @@ def _record_inbox_message(
     profile_name: str | None,
     wam_id: str,
     text: str,
+    message_type: str = "text",
+    media_s3_key: str | None = None,
+    media_content_type: str | None = None,
+    media_filename: str | None = None,
 ) -> None:
     """
     Store an inbound message in FojiApi's shared inbox. FojiApi owns the Postgres
@@ -173,6 +226,10 @@ def _record_inbox_message(
         "profileName": profile_name,
         "wamId": wam_id,
         "text": text,
+        "messageType": message_type,
+        "mediaS3Key": media_s3_key,
+        "mediaContentType": media_content_type,
+        "mediaFileName": media_filename,
     }
     headers = {"X-Internal-Key": settings.internal_api_key}
 

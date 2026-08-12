@@ -58,3 +58,15 @@ def upload_jsonl(s3_key: str, records: list[dict]) -> None:
 
 def extraction_prefix(company_id: int, file_id: int, version: int) -> str:
     return f"tenant/{company_id}/files/{file_id}/extractions/{version}"
+
+
+def upload_bytes(s3_key: str, data: bytes, content_type: str) -> None:
+    """Upload raw bytes (used for WhatsApp media)."""
+    cfg = get_settings()
+    _client().put_object(
+        Bucket=cfg.aws_s3_bucket,
+        Key=s3_key,
+        Body=data,
+        ContentType=content_type,
+    )
+    logger.debug("Uploaded %d bytes → s3://%s/%s", len(data), cfg.aws_s3_bucket, s3_key)

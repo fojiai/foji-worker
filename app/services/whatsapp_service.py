@@ -85,3 +85,28 @@ def parse_inbound(body: dict) -> list[dict]:
                     }
                 )
     return messages
+
+
+def fetch_media(media_id: str, token: str | None = None) -> tuple[bytes, str | None]:
+    """
+    Download WhatsApp media. Two hops: the media id resolves to a short-lived
+    URL, which must then be fetched with the same bearer token.
+
+    Returns (content_bytes, mime_type).
+    """
+    headers = _headers(token)
+
+    with httpx.Client(timeout=30) as client:
+        meta_resp = client.get(f"{_meta_base()}/{media_id}", headers=headers)
+        meta_resp.raise_for_status()
+        meta = meta_resp.json()
+
+        url = meta.get("url")
+        if not url:
+            raise ValueError(f"No download URL returned for media {media_id}")
+
+        # The CDN URL still requires the Authorization header.
+        binary = client.get(url, headers={"Authorization": headers["Authorization"]})
+        binary.raise_for_status()
+
+    return binary.content, meta.get("mime_type")
