@@ -17,7 +17,7 @@ Message shape:
 Flow:
   1. Parse the SQS record
   2. Resolve which Agent owns this phone_number_id
-  3. Call foji-ai-api /internal/whatsapp/chat (returns full response, not streamed)
+  3. Call foji-ai-api /api/v1/internal/whatsapp/chat (full response, not streamed)
   4. Send the response back via Meta Cloud API
   5. On any failure: log + skip (do NOT raise — let Lambda ack the message)
 """
@@ -151,7 +151,11 @@ def _call_ai_api(
     routing — it returns a plain-text string response (not streamed).
     """
     settings = get_settings()
-    url = f"{settings.foji_ai_api_url}/internal/whatsapp/chat"
+    # foji-ai-api mounts every router under /api/v1 (see its main.py). Without
+    # the prefix this 404s, and because the reply is what gets sent back to
+    # WhatsApp, the customer just never hears anything.
+    base = settings.foji_ai_api_url.rstrip("/")
+    url = f"{base}/api/v1/internal/whatsapp/chat"
     payload = {
         "agent_token": agent_token,
         "session_id": f"wa:{session_id}",  # prefix to namespace WhatsApp sessions
