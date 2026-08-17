@@ -42,7 +42,11 @@ class Settings(BaseSettings):
     meta_whatsapp_token: str = ""
     meta_phone_number_id: str = ""
     meta_graph_version: str = "v25.0"  # Meta Graph API version for Cloud API calls
-    google_calendar_encryption_key: str = ""  # base64 32-byte AES key shared with FojiApi (decrypts per-agent WA tokens)
+    # base64 32-byte AES key shared with FojiApi and foji-ai-api. Decrypts
+    # per-agent WhatsApp tokens as well as calendar tokens, so the legacy
+    # google_calendar_ name undersells it — kept only as a fallback.
+    encryption_key: str = ""
+    google_calendar_encryption_key: str = ""
 
     # Chunking
     chunk_target_tokens: int = 512
