@@ -48,6 +48,8 @@ def send_text(phone_number_id: str, to: str, body: str, token: str | None = None
             resp.status_code,
             resp.text[:500],
         )
+        if is_billing_failure(resp.text):
+            raise WhatsAppBillingError(resp.text[:300])
         if is_auth_failure(resp.status_code, resp.text):
             raise WhatsAppAuthError(resp.text[:300])
         resp.raise_for_status()
@@ -61,6 +63,32 @@ class WhatsAppAuthError(Exception):
     customer has to reconnect. The handler flags the agent so the dashboard can
     say so, rather than the channel going quiet.
     """
+
+
+class WhatsAppBillingError(Exception):
+    """Meta is refusing to deliver because the customer's WABA cannot be billed.
+
+    Separate from an auth failure because the fix is completely different:
+    reconnecting does nothing, they have to attach a payment method in Meta
+    Business Manager.
+    """
+
+
+def is_billing_failure(body: str) -> bool:
+    """Error 131042 — "Business Eligibility Payment Issue".
+
+    Meta blocks every outgoing message until the WABA has a usable payment
+    method, so this is the difference between "quiet day" and "your account
+    has been switched off".
+    """
+    try:
+        error = json.loads(body).get("error", {})
+    except (ValueError, AttributeError):
+        return False
+    if error.get("code") == 131042:
+        return True
+    return error.get("error_data", {}).get("details", "").lower().find("payment") >= 0 \
+        and error.get("code") == 131042
 
 
 def is_auth_failure(status_code: int, body: str) -> bool:

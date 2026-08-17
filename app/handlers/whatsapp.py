@@ -34,6 +34,7 @@ from app.core.encryption import decrypt
 from app.services.agent_resolver import resolve_agent_by_phone
 from app.services.whatsapp_service import (
     WhatsAppAuthError,
+    WhatsAppBillingError,
     fetch_media,
     parse_inbound,
     send_text,
@@ -146,6 +147,11 @@ def _process_message(msg: dict) -> None:
 
         try:
             send_text(phone_number_id, sender, reply, token=_agent_token(agent))
+        except WhatsAppBillingError:
+            # Meta has switched this customer's messaging off for want of a card.
+            # Surfacing it as "reconnect" would send them to the wrong place.
+            _flag_needs_reconnect(agent.id, reason="billing")
+            raise
         except WhatsAppAuthError:
             # The token is dead, not the message. Flag the agent so the dashboard
             # asks the owner to reconnect — otherwise this channel just goes
@@ -229,8 +235,11 @@ def _consume_allowance(agent_id: int, category: str = "service") -> bool:
         return True
 
 
-def _flag_needs_reconnect(agent_id: int) -> None:
+def _flag_needs_reconnect(agent_id: int, reason: str = "reconnect") -> None:
     """Tell FojiApi this agent's WhatsApp connection is broken.
+
+    `reason` distinguishes a dead token ("reconnect") from a WABA that cannot be
+    billed ("billing") — different problems with different fixes.
 
     Best effort: if we cannot reach the API the send failure is already logged,
     and the twice-daily refresh sweep will reach the same conclusion.
@@ -241,7 +250,7 @@ def _flag_needs_reconnect(agent_id: int) -> None:
         with httpx.Client(timeout=10) as client:
             resp = client.post(
                 url,
-                json={"agentId": agent_id},
+                json={"agentId": agent_id, "reason": reason},
                 headers={"X-Internal-Key": settings.internal_api_key},
             )
         if resp.status_code not in (200, 204):
