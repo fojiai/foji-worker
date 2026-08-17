@@ -134,6 +134,16 @@ def _process_message(msg: dict) -> None:
 
         reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
 
+        # Meter before sending. Meta bills per message, so this is the only
+        # place the cost can actually be bounded — and it has to be live, not a
+        # nightly aggregate, or a customer can outrun their allowance by a day.
+        if not _consume_allowance(agent.id):
+            logger.warning(
+                "WhatsApp allowance exhausted for agent_id=%d — not replying to %s",
+                agent.id, sender,
+            )
+            return
+
         try:
             send_text(phone_number_id, sender, reply, token=_agent_token(agent))
         except WhatsAppAuthError:
@@ -190,6 +200,35 @@ def _call_ai_api(
     return reply
 
 
+def _consume_allowance(agent_id: int, category: str = "service") -> bool:
+    """Record one outbound message and ask whether it is within the plan.
+
+    Fails OPEN: if FojiApi is unreachable we still reply. A customer whose
+    agent goes silent because our own API blipped is a worse outcome than a
+    handful of unmetered messages, and the sweep reconciles nothing here —
+    the counter simply misses those sends.
+    """
+    settings = get_settings()
+    url = f"{settings.foji_api_base_url}/api/whatsapp/usage/internal/consume"
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(
+                url,
+                json={"agentId": agent_id, "category": category},
+                headers={"X-Internal-Key": settings.internal_api_key},
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "Usage check for agent %d returned %d — allowing the send",
+                agent_id, resp.status_code,
+            )
+            return True
+        return bool(resp.json().get("allowed", True))
+    except Exception:
+        logger.exception("Usage check for agent %d failed — allowing the send", agent_id)
+        return True
+
+
 def _flag_needs_reconnect(agent_id: int) -> None:
     """Tell FojiApi this agent's WhatsApp connection is broken.
 
@@ -202,7 +241,7 @@ def _flag_needs_reconnect(agent_id: int) -> None:
         with httpx.Client(timeout=10) as client:
             resp = client.post(
                 url,
-                json={"agent_id": agent_id},
+                json={"agentId": agent_id},
                 headers={"X-Internal-Key": settings.internal_api_key},
             )
         if resp.status_code not in (200, 204):
