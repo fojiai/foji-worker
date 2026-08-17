@@ -6,6 +6,8 @@ Docs: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages
 
 import logging
 
+import json
+
 import httpx
 
 from app.core.config import get_settings
@@ -46,8 +48,38 @@ def send_text(phone_number_id: str, to: str, body: str, token: str | None = None
             resp.status_code,
             resp.text[:500],
         )
+        if is_auth_failure(resp.status_code, resp.text):
+            raise WhatsAppAuthError(resp.text[:300])
         resp.raise_for_status()
     logger.info("WhatsApp message sent to=%s via phone_number_id=%s", to, phone_number_id)
+
+
+class WhatsAppAuthError(Exception):
+    """Meta rejected our token for this tenant.
+
+    Distinct from a transient send failure: retrying will not help, and the
+    customer has to reconnect. The handler flags the agent so the dashboard can
+    say so, rather than the channel going quiet.
+    """
+
+
+def is_auth_failure(status_code: int, body: str) -> bool:
+    """Whether Meta is telling us the token is dead rather than the send bad.
+
+    Code 190 is the expired/invalid-token family; 401/403 cover the rest. We
+    check the code in the body too, because Meta returns 400 for some token
+    errors.
+    """
+    if status_code in (401, 403):
+        return True
+    try:
+        error = json.loads(body).get("error", {})
+    except (ValueError, AttributeError):
+        return False
+    if error.get("code") == 190:
+        return True
+    # 200-series subcodes are permission problems, which also need a reconnect.
+    return error.get("type") == "OAuthException" and error.get("code") in (10, 200, 803)
 
 
 def parse_inbound(body: dict) -> list[dict]:

@@ -32,7 +32,12 @@ from app.core.config import get_settings
 from app.core.database import get_session
 from app.core.encryption import decrypt
 from app.services.agent_resolver import resolve_agent_by_phone
-from app.services.whatsapp_service import fetch_media, parse_inbound, send_text
+from app.services.whatsapp_service import (
+    WhatsAppAuthError,
+    fetch_media,
+    parse_inbound,
+    send_text,
+)
 from app.utils.s3 import upload_bytes
 
 logger = logging.getLogger(__name__)
@@ -129,7 +134,14 @@ def _process_message(msg: dict) -> None:
 
         reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
 
-        send_text(phone_number_id, sender, reply, token=_agent_token(agent))
+        try:
+            send_text(phone_number_id, sender, reply, token=_agent_token(agent))
+        except WhatsAppAuthError:
+            # The token is dead, not the message. Flag the agent so the dashboard
+            # asks the owner to reconnect — otherwise this channel just goes
+            # quiet and looks like nobody messaged today.
+            _flag_needs_reconnect(agent.id)
+            raise
 
         logger.info(
             "WhatsApp handled: agent_id=%d sender=%s message_id=%s",
@@ -176,6 +188,29 @@ def _call_ai_api(
         raise ValueError("AI API returned an empty reply")
 
     return reply
+
+
+def _flag_needs_reconnect(agent_id: int) -> None:
+    """Tell FojiApi this agent's WhatsApp connection is broken.
+
+    Best effort: if we cannot reach the API the send failure is already logged,
+    and the twice-daily refresh sweep will reach the same conclusion.
+    """
+    settings = get_settings()
+    url = f"{settings.foji_api_base_url}/api/whatsapp/onboarding/internal/needs-reconnect"
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(
+                url,
+                json={"agent_id": agent_id},
+                headers={"X-Internal-Key": settings.internal_api_key},
+            )
+        if resp.status_code not in (200, 204):
+            logger.warning(
+                "Could not flag agent %d for reconnection: status=%d", agent_id, resp.status_code
+            )
+    except Exception:
+        logger.exception("Could not flag agent %d for reconnection", agent_id)
 
 
 def _agent_token(agent) -> str | None:
