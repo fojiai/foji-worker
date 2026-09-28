@@ -56,6 +56,45 @@ def send_text(phone_number_id: str, to: str, body: str, token: str | None = None
     logger.info("WhatsApp message sent to=%s via phone_number_id=%s", to, phone_number_id)
 
 
+def mark_read(
+    phone_number_id: str,
+    message_id: str,
+    token: str | None = None,
+    typing: bool = False,
+    timeout: float = 4,
+) -> bool:
+    """Blue ticks for `message_id` (and everything before it), optionally with a
+    "digitando…" indicator.
+
+    Meta shows the indicator until we send a reply or for up to 25 seconds.
+    Neither is a billable message. Best-effort: a failure here must never cost
+    the customer their reply, so it logs and returns False instead of raising.
+    """
+    if not message_id:
+        return False
+    payload = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id,
+    }
+    if typing:
+        payload["typing_indicator"] = {"type": "text"}
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                f"{_meta_base()}/{phone_number_id}/messages", json=payload, headers=_headers(token)
+            )
+        if resp.status_code not in (200, 201):
+            logger.warning(
+                "WhatsApp mark-read failed: status=%d body=%s", resp.status_code, resp.text[:300]
+            )
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WhatsApp mark-read failed for %s: %s", message_id, exc)
+        return False
+
+
 class WhatsAppAuthError(Exception):
     """Meta rejected our token for this tenant.
 

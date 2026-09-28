@@ -40,6 +40,7 @@ from app.services.whatsapp_service import (
     WhatsAppAuthError,
     WhatsAppBillingError,
     fetch_media,
+    mark_read,
     parse_inbound,
     send_text,
 )
@@ -198,6 +199,18 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
 
         if deadline is None:
             deadline = time.monotonic() + _DEFAULT_BUDGET_SECONDS
+
+        # Blue ticks and "digitando…" straight away, the way a person picks up
+        # the phone — the customer sees someone is on it while the AI (and any
+        # voice-note transcription) works. Messages we won't answer (a sticker)
+        # are still marked read, just without the typing indicator. Inbox mode
+        # never gets here: there, ticks wait until a person opens the thread.
+        stays_quiet = (
+            not text
+            and not (message_type == "audio" and media_id)
+            and message_type not in _DESCRIBABLE_MEDIA
+        )
+        mark_read(phone_number_id, message_id, token=_agent_token(agent), typing=not stays_quiet)
 
         # Voice notes are downloaded and sent to the AI API to be transcribed and
         # answered. Media without a caption used to be dropped silently, which
