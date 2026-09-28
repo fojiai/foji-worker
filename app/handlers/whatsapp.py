@@ -28,6 +28,7 @@ import base64
 import json
 import logging
 import mimetypes
+import re
 import time
 
 import httpx
@@ -108,6 +109,64 @@ def _deadline(context) -> float:
 
 def _time_left(deadline: float) -> float:
     return max(3.0, deadline - time.monotonic())
+
+
+# Splitting long replies into two messages (Agent.WhatsAppSplitReplies).
+# Only replies long enough to feel like a wall of text are split, and only where
+# both halves stand on their own.
+_SPLIT_MIN_CHARS = 220
+_SPLIT_MIN_PART = 60
+_SENTENCE_END = re.compile(r"[.!?…](?=\s)")
+
+
+def _split_reply(text: str) -> list[str]:
+    """Split at the natural break nearest the middle: a paragraph if there is
+    one, else a sentence end. Returns [text] when there's no good split."""
+    text = text.strip()
+    if len(text) < _SPLIT_MIN_CHARS:
+        return [text]
+
+    middle = len(text) / 2
+
+    def best(cuts: list[int]) -> int | None:
+        ok = [c for c in cuts
+              if len(text[:c].strip()) >= _SPLIT_MIN_PART and len(text[c:].strip()) >= _SPLIT_MIN_PART]
+        return min(ok, key=lambda c: abs(c - middle)) if ok else None
+
+    paragraphs = [m.end() for m in re.finditer(r"\n\s*\n", text)]
+    cut = best(paragraphs)
+    if cut is None:
+        cut = best([m.end() for m in _SENTENCE_END.finditer(text)])
+    if cut is None:
+        return [text]
+    return [text[:cut].strip(), text[cut:].strip()]
+
+
+def _split_enabled(db, agent) -> bool:
+    """Read the per-agent flag without ever breaking a reply over it.
+
+    The column is deferred, so this is its own query; if FojiApi hasn't run the
+    migration yet it fails — then we roll the session back and send one message.
+    """
+    try:
+        return bool(agent.whats_app_split_replies)
+    except Exception:  # noqa: BLE001
+        logger.warning("WhatsAppSplitReplies unavailable (not migrated yet?) — sending one message")
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
+def _pause_before(part: str, deadline: float) -> float:
+    """A human beat before the second message, scaled to its length but never
+    at the cost of the Lambda's time limit."""
+    desired = min(3.5, max(1.2, len(part) * 0.02))
+    # Time really left in the run = the AI deadline + the send reserve; keep
+    # ~4 s of it for the send itself.
+    available = deadline - time.monotonic() + _SEND_RESERVE_SECONDS - 4
+    return max(0.0, min(desired, available))
 
 
 def _fallback_reply(agent, kind: str) -> str:
@@ -280,8 +339,21 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
             )
             return
 
+        # Optionally two messages instead of one block. The second is metered
+        # on its own; if the allowance can't cover it, the reply goes out whole.
+        parts = [reply]
+        if _split_enabled(db, agent):
+            halves = _split_reply(reply)
+            if len(halves) == 2 and _consume_allowance(agent.id):
+                parts = halves
+
         try:
-            send_text(phone_number_id, sender, reply, token=_agent_token(agent))
+            for i, part in enumerate(parts):
+                if i > 0:
+                    # "digitando…" again, and a beat before the next message.
+                    mark_read(phone_number_id, message_id, token=_agent_token(agent), typing=True)
+                    time.sleep(_pause_before(part, deadline))
+                send_text(phone_number_id, sender, part, token=_agent_token(agent))
         except WhatsAppBillingError:
             # Meta has switched this customer's messaging off for want of a card.
             # Surfacing it as "reconnect" would send them to the wrong place.

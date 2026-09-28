@@ -19,6 +19,12 @@ class Agent(Base):
     whats_app_mode: Mapped[str] = mapped_column("WhatsAppMode", String, default="Agent")
     # "PtBr" | "En" | "Es" — for the few messages the worker writes itself.
     agent_language: Mapped[str | None] = mapped_column("AgentLanguage", String(10), nullable=True)
+    # Deferred: loaded only when read, so the agent lookup never depends on this
+    # column existing. The worker and FojiApi (which runs the migration) deploy
+    # independently; see whatsapp._split_enabled for the fallback.
+    whats_app_split_replies: Mapped[bool] = mapped_column(
+        "WhatsAppSplitReplies", Boolean, default=False, deferred=True
+    )
     agent_token: Mapped[str] = mapped_column("AgentToken", String(64))
     created_at: Mapped[datetime] = mapped_column("CreatedAt", DateTime)
     updated_at: Mapped[datetime] = mapped_column("UpdatedAt", DateTime)
