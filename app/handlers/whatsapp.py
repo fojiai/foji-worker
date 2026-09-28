@@ -79,14 +79,21 @@ _FALLBACK_REPLIES = {
     # A photo, document or video with no caption. Honest about what we can't
     # see yet, instead of ignoring it.
     "media_no_caption": {
-        "PtBr": "Recebi! 🙂 Por aqui ainda não consigo abrir imagens e arquivos — me conta por escrito o que você precisa?",
-        "Es": "¡Recibido! 🙂 Por aquí todavía no puedo abrir imágenes ni archivos — ¿me cuentas por escrito qué necesitas?",
-        "En": "Got it! 🙂 I can't open images or files here yet — could you tell me in text what you need?",
+        "PtBr": "Recebi! 🙂 Por aqui ainda não consigo abrir arquivos e vídeos — me conta por escrito o que você precisa?",
+        "Es": "¡Recibido! 🙂 Por aquí todavía no puedo abrir archivos ni videos — ¿me cuentas por escrito qué necesitas?",
+        "En": "Got it! 🙂 I can't open files or videos here yet — could you tell me in text what you need?",
+    },
+    # A photo we couldn't download (or too big), sent without any text.
+    "photo_failed": {
+        "PtBr": "Não consegui abrir sua foto agora 😅 Pode me contar por escrito o que você precisa?",
+        "Es": "No pude abrir tu foto ahora 😅 ¿Me cuentas por escrito qué necesitas?",
+        "En": "I couldn't open your photo just now 😅 Could you tell me in text what you need?",
     },
 }
 
-# Meta caps WhatsApp media at 16 MB.
+# Meta caps WhatsApp media at 16 MB, and images at 5 MB.
 _VOICE_MAX_BYTES = 16 * 1024 * 1024
+_PHOTO_MAX_BYTES = 5 * 1024 * 1024
 # Media we answer with "tell me in text" when it comes without a caption.
 # Stickers, reactions and the like are left alone — a person wouldn't reply to those either.
 _DESCRIBABLE_MEDIA = {"image", "document", "video"}
@@ -264,9 +271,9 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
         hybrid = (agent.whats_app_mode or "Agent") == "Hybrid"
         inbox_conversation_id: int | None = None
         awaiting_human = False
-        prefetched_audio: tuple[bytes, str] | None = None
+        prefetched_media: tuple[bytes, str] | None = None
         if hybrid:
-            state, prefetched_audio = _record_for_hybrid(
+            state, prefetched_media = _record_for_hybrid(
                 agent,
                 phone_number_id=phone_number_id, sender=sender, profile_name=profile_name,
                 message_id=message_id, text=text, message_type=message_type,
@@ -307,11 +314,13 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
         # left the customer on "visto".
         audio: bytes | None = None
         audio_mime: str | None = None
+        image: bytes | None = None
+        image_mime: str | None = None
         fallback_kind: str | None = None
         if message_type == "audio" and media_id:
             try:
-                if prefetched_audio:  # hybrid already downloaded it for the inbox
-                    audio, audio_mime = prefetched_audio
+                if prefetched_media:  # hybrid already downloaded it for the inbox
+                    audio, audio_mime = prefetched_media
                 else:
                     audio, fetched_mime = fetch_media(
                         media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
@@ -322,6 +331,23 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
             except Exception:
                 logger.exception("Could not download voice note %s from %s", media_id, sender)
                 audio, fallback_kind = None, "voice_failed"
+        elif message_type == "image" and media_id:
+            # The AI looks at the photo itself; the caption (if any) is the text.
+            try:
+                if prefetched_media:  # hybrid already downloaded it for the inbox
+                    image, image_mime = prefetched_media
+                else:
+                    image, fetched_mime = fetch_media(
+                        media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
+                    )
+                    image_mime = fetched_mime or media_mime
+                if len(image) > _PHOTO_MAX_BYTES:
+                    image = None
+            except Exception:
+                logger.exception("Could not download photo %s from %s", media_id, sender)
+                image = None
+            if image is None and not text:
+                fallback_kind = "photo_failed"
         elif not text:
             if message_type in _DESCRIBABLE_MEDIA:
                 fallback_kind = "media_no_caption"
@@ -338,7 +364,8 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
             else:
                 reply, handoff = _call_ai_api(
                     agent.agent_token, sender, text or "", profile_name,
-                    audio=audio, audio_mime=audio_mime, timeout=_time_left(deadline),
+                    audio=audio, audio_mime=audio_mime, image=image, image_mime=image_mime,
+                    timeout=_time_left(deadline),
                     hybrid=hybrid, inbox_conversation_id=inbox_conversation_id,
                     exclude_wam_id=message_id if hybrid else None,
                     awaiting_human=awaiting_human,
@@ -430,6 +457,8 @@ def _call_ai_api(
     profile_name: str | None = None,
     audio: bytes | None = None,
     audio_mime: str | None = None,
+    image: bytes | None = None,
+    image_mime: str | None = None,
     timeout: float = _DEFAULT_BUDGET_SECONDS,
     hybrid: bool = False,
     inbox_conversation_id: int | None = None,
@@ -461,6 +490,9 @@ def _call_ai_api(
     if audio:
         payload["audio_base64"] = base64.b64encode(audio).decode("ascii")
         payload["audio_mime"] = audio_mime
+    if image:
+        payload["image_base64"] = base64.b64encode(image).decode("ascii")
+        payload["image_mime"] = image_mime
     if hybrid:
         payload["hybrid"] = True
         payload["inbox_conversation_id"] = inbox_conversation_id
@@ -586,21 +618,21 @@ def _record_for_hybrid(
     Hybrid mode: put the inbound message in the team inbox before the AI answers.
 
     Media is downloaded once — the copy goes to S3 for the inbox, and a voice
-    note's bytes are handed back so the AI can transcribe them without a second
-    download. Returns (inbox state, prefetched audio). The state is None if the
+    note's or photo's bytes are handed back so the AI can use them without a
+    second download. Returns (inbox state, prefetched media). The state is None if the
     inbox write failed; the caller then answers anyway rather than leave the
     customer waiting.
     """
     media_key = media_content_type = None
-    audio: tuple[bytes, str] | None = None
+    media: tuple[bytes, str] | None = None
     if media_id:
         try:
             content, fetched = fetch_media(
                 media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
             )
             media_content_type = fetched or media_mime or "application/octet-stream"
-            if message_type == "audio":
-                audio = (content, media_content_type)
+            if message_type in ("audio", "image"):
+                media = (content, media_content_type)
             media_key = _upload_media(agent.company_id, agent.id, media_id, content, media_content_type)
         except Exception:
             logger.exception("Hybrid: could not store media %s — recording without it", media_id)
@@ -621,7 +653,7 @@ def _record_for_hybrid(
     except Exception:
         logger.exception("Hybrid: inbox write failed for %s — answering without it", message_id)
         state = None
-    return state, audio
+    return state, media
 
 
 def _record_ai_reply(agent_id: int, wa_id: str, text: str) -> None:
