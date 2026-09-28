@@ -17,6 +17,8 @@ class Agent(Base):
     whats_app_phone_number_id: Mapped[str | None] = mapped_column("WhatsAppPhoneNumberId", String, nullable=True)
     whats_app_access_token_encrypted: Mapped[str | None] = mapped_column("WhatsAppAccessTokenEncrypted", String, nullable=True)
     whats_app_mode: Mapped[str] = mapped_column("WhatsAppMode", String, default="Agent")
+    # "PtBr" | "En" | "Es" — for the few messages the worker writes itself.
+    agent_language: Mapped[str | None] = mapped_column("AgentLanguage", String(10), nullable=True)
     agent_token: Mapped[str] = mapped_column("AgentToken", String(64))
     created_at: Mapped[datetime] = mapped_column("CreatedAt", DateTime)
     updated_at: Mapped[datetime] = mapped_column("UpdatedAt", DateTime)

@@ -19,7 +19,9 @@ Flow:
   2. Resolve which Agent owns this phone_number_id
   3. Call foji-ai-api /api/v1/internal/whatsapp/chat (full response, not streamed)
   4. Send the response back via Meta Cloud API
-  5. On any failure: log + skip (do NOT raise — let Lambda ack the message)
+  5. If the AI can't answer, send a short friendly fallback instead of silence
+     (except 402 — plan inactive — where we stay quiet)
+  6. On any failure: log + skip (do NOT raise — let Lambda ack the message)
 """
 
 import json
@@ -43,6 +45,28 @@ from app.utils.s3 import upload_bytes
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# What the customer reads when the AI can't answer. Failures aren't retried
+# (the handler acks every record), so without these the customer was simply left
+# on "visto" — which reads as a business ignoring them, not as a glitch.
+_FALLBACK_REPLIES = {
+    "error": {
+        "PtBr": "Opa, tive um probleminha pra te responder agora 😅 Pode me mandar de novo daqui a pouquinho?",
+        "Es": "Uy, tuve un problemita para responderte ahora 😅 ¿Me lo mandas de nuevo en un ratito?",
+        "En": "Oops, I had a little trouble answering just now 😅 Could you send that again in a moment?",
+    },
+    # The business's monthly conversation limit is used up.
+    "limit": {
+        "PtBr": "No momento não consigo responder por aqui 🙏 Se for urgente, fale com a gente por outro canal.",
+        "Es": "En este momento no puedo responder por aquí 🙏 Si es urgente, contáctanos por otro canal.",
+        "En": "I can't reply here right now 🙏 If it's urgent, please reach us through another channel.",
+    },
+}
+
+
+def _fallback_reply(agent, kind: str) -> str:
+    replies = _FALLBACK_REPLIES[kind]
+    return replies.get(agent.agent_language or "PtBr") or replies["PtBr"]
 
 
 def handler(event: dict, context) -> dict:
@@ -133,9 +157,33 @@ def _process_message(msg: dict) -> None:
             )
             return
 
-        reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
+        try:
+            reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 402:
+                # Plan inactive or without WhatsApp — the business isn't paying
+                # for this channel, so we don't answer on its behalf.
+                logger.warning(
+                    "AI API refused agent_id=%d (402: plan inactive or no WhatsApp) — not replying to %s",
+                    agent.id, sender,
+                )
+                return
+            logger.warning(
+                "AI API returned %d for agent_id=%d — sending a fallback to %s",
+                status, agent.id, sender,
+            )
+            reply = _fallback_reply(agent, "limit" if status == 429 else "error")
+        except Exception:
+            # Timeout, network, empty reply, 5xx. Better a friendly "try again"
+            # than silence.
+            logger.exception(
+                "AI API failed for agent_id=%d — sending a fallback to %s", agent.id, sender
+            )
+            reply = _fallback_reply(agent, "error")
 
-        # Meter before sending. Meta bills per message, so this is the only
+        # Meter before sending — the fallback too, so it stays inside the
+        # allowance like any other message we send. Meta bills per message, so this is the only
         # place the cost can actually be bounded — and it has to be live, not a
         # nightly aggregate, or a customer can outrun their allowance by a day.
         if not _consume_allowance(agent.id):
