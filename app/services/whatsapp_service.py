@@ -147,7 +147,9 @@ def parse_inbound(body: dict) -> list[dict]:
     return messages
 
 
-def fetch_media(media_id: str, token: str | None = None) -> tuple[bytes, str | None]:
+def fetch_media(
+    media_id: str, token: str | None = None, timeout: float = 30
+) -> tuple[bytes, str | None]:
     """
     Download WhatsApp media. Two hops: the media id resolves to a short-lived
     URL, which must then be fetched with the same bearer token.
@@ -156,7 +158,7 @@ def fetch_media(media_id: str, token: str | None = None) -> tuple[bytes, str | N
     """
     headers = _headers(token)
 
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=timeout) as client:
         meta_resp = client.get(f"{_meta_base()}/{media_id}", headers=headers)
         meta_resp.raise_for_status()
         meta = meta_resp.json()

@@ -24,9 +24,11 @@ Flow:
   6. On any failure: log + skip (do NOT raise — let Lambda ack the message)
 """
 
+import base64
 import json
 import logging
 import mimetypes
+import time
 
 import httpx
 
@@ -61,7 +63,50 @@ _FALLBACK_REPLIES = {
         "Es": "En este momento no puedo responder por aquí 🙏 Si es urgente, contáctanos por otro canal.",
         "En": "I can't reply here right now 🙏 If it's urgent, please reach us through another channel.",
     },
+    # A voice note we couldn't even download from Meta.
+    "voice_failed": {
+        "PtBr": "Não consegui ouvir seu áudio agora 😅 Pode me mandar por escrito?",
+        "Es": "No pude escuchar tu audio ahora 😅 ¿Me lo puedes escribir?",
+        "En": "I couldn't play your voice message just now 😅 Could you type it for me?",
+    },
+    "voice_too_long": {
+        "PtBr": "Esse áudio ficou grande demais pra eu ouvir por aqui 😅 Consegue me mandar um resumo por escrito?",
+        "Es": "Ese audio es demasiado largo para escucharlo por aquí 😅 ¿Me mandas un resumen por escrito?",
+        "En": "That voice message is too long for me to play here 😅 Could you send me a short summary in text?",
+    },
+    # A photo, document or video with no caption. Honest about what we can't
+    # see yet, instead of ignoring it.
+    "media_no_caption": {
+        "PtBr": "Recebi! 🙂 Por aqui ainda não consigo abrir imagens e arquivos — me conta por escrito o que você precisa?",
+        "Es": "¡Recibido! 🙂 Por aquí todavía no puedo abrir imágenes ni archivos — ¿me cuentas por escrito qué necesitas?",
+        "En": "Got it! 🙂 I can't open images or files here yet — could you tell me in text what you need?",
+    },
 }
+
+# Meta caps WhatsApp media at 16 MB.
+_VOICE_MAX_BYTES = 16 * 1024 * 1024
+# Media we answer with "tell me in text" when it comes without a caption.
+# Stickers, reactions and the like are left alone — a person wouldn't reply to those either.
+_DESCRIBABLE_MEDIA = {"image", "document", "video"}
+
+# The Lambda has a hard timeout. Whatever the AI call takes, this much is kept
+# back so a fallback can still be metered and sent — otherwise a slow AI reply
+# kills the run and the customer gets nothing at all.
+_SEND_RESERVE_SECONDS = 8
+_DEFAULT_BUDGET_SECONDS = 22
+
+
+def _deadline(context) -> float:
+    """Monotonic time by which the AI work must finish, leaving room to reply."""
+    try:
+        remaining = context.get_remaining_time_in_millis() / 1000
+    except Exception:  # noqa: BLE001 — no Lambda context (tests, local runs)
+        remaining = _DEFAULT_BUDGET_SECONDS + _SEND_RESERVE_SECONDS
+    return time.monotonic() + max(5.0, remaining - _SEND_RESERVE_SECONDS)
+
+
+def _time_left(deadline: float) -> float:
+    return max(3.0, deadline - time.monotonic())
 
 
 def _fallback_reply(agent, kind: str) -> str:
@@ -75,7 +120,7 @@ def handler(event: dict, context) -> dict:
     for record in event.get("Records", []):
         try:
             body = json.loads(record["body"])
-            _process_message(body)
+            _process_message(body, deadline=_deadline(context))
             results.append({"message_id": body.get("message_id"), "status": "ok"})
         except Exception as exc:
             msg_id = record.get("messageId", "unknown")
@@ -84,7 +129,7 @@ def handler(event: dict, context) -> dict:
     return {"results": results}
 
 
-def _process_message(msg: dict) -> None:
+def _process_message(msg: dict, deadline: float | None = None) -> None:
     """Process a single inbound WhatsApp message."""
     phone_number_id = msg.get("phone_number_id", "")
     sender = msg.get("from", "")
@@ -151,14 +196,43 @@ def _process_message(msg: dict) -> None:
             )
             return
 
-        if not text:
-            logger.info(
-                "Media message from %s with no caption and agent in AI mode — skipping", sender
-            )
-            return
+        if deadline is None:
+            deadline = time.monotonic() + _DEFAULT_BUDGET_SECONDS
+
+        # Voice notes are downloaded and sent to the AI API to be transcribed and
+        # answered. Media without a caption used to be dropped silently, which
+        # left the customer on "visto".
+        audio: bytes | None = None
+        audio_mime: str | None = None
+        fallback_kind: str | None = None
+        if message_type == "audio" and media_id:
+            try:
+                audio, fetched_mime = fetch_media(
+                    media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
+                )
+                audio_mime = fetched_mime or media_mime
+                if len(audio) > _VOICE_MAX_BYTES:
+                    audio, fallback_kind = None, "voice_too_long"
+            except Exception:
+                logger.exception("Could not download voice note %s from %s", media_id, sender)
+                audio, fallback_kind = None, "voice_failed"
+        elif not text:
+            if message_type in _DESCRIBABLE_MEDIA:
+                fallback_kind = "media_no_caption"
+            else:
+                logger.info(
+                    "%s from %s with no text in AI mode — nothing to answer", message_type, sender
+                )
+                return
 
         try:
-            reply = _call_ai_api(agent.agent_token, sender, text, profile_name)
+            if fallback_kind:
+                reply = _fallback_reply(agent, fallback_kind)
+            else:
+                reply = _call_ai_api(
+                    agent.agent_token, sender, text or "", profile_name,
+                    audio=audio, audio_mime=audio_mime, timeout=_time_left(deadline),
+                )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 402:
@@ -218,13 +292,20 @@ def _process_message(msg: dict) -> None:
 
 
 def _call_ai_api(
-    agent_token: str, session_id: str, message: str, profile_name: str | None = None
+    agent_token: str,
+    session_id: str,
+    message: str,
+    profile_name: str | None = None,
+    audio: bytes | None = None,
+    audio_mime: str | None = None,
+    timeout: float = _DEFAULT_BUDGET_SECONDS,
 ) -> str:
     """
     Call foji-ai-api's internal WhatsApp endpoint.
 
     The AI API handles history lookup, context assembly, and provider
-    routing — it returns a plain-text string response (not streamed).
+    routing — it returns a plain-text string response (not streamed). A voice
+    note travels as base64 and is transcribed there.
     """
     settings = get_settings()
     # foji-ai-api mounts every router under /api/v1 (see its main.py). Without
@@ -239,9 +320,14 @@ def _call_ai_api(
         "sender_phone": session_id,
         "profile_name": profile_name,
     }
+    if audio:
+        payload["audio_base64"] = base64.b64encode(audio).decode("ascii")
+        payload["audio_mime"] = audio_mime
     headers = {"X-Internal-Key": settings.internal_api_key}
 
-    with httpx.Client(timeout=30) as client:
+    # Bounded by the Lambda's remaining time (see _deadline) so a slow answer
+    # still leaves room to send a fallback.
+    with httpx.Client(timeout=timeout) as client:
         resp = client.post(url, json=payload, headers=headers)
 
     resp.raise_for_status()
