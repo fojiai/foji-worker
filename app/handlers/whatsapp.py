@@ -263,6 +263,7 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
         # only answers while no person has taken the conversation over.
         hybrid = (agent.whats_app_mode or "Agent") == "Hybrid"
         inbox_conversation_id: int | None = None
+        awaiting_human = False
         prefetched_audio: tuple[bytes, str] | None = None
         if hybrid:
             state, prefetched_audio = _record_for_hybrid(
@@ -285,6 +286,9 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
                     )
                     return
                 inbox_conversation_id = state.get("conversationId")
+                # The team was already called and hasn't answered: the AI is
+                # back on, but mustn't call them again.
+                awaiting_human = bool(state.get("awaitingHuman"))
 
         # Blue ticks and "digitando…" straight away, the way a person picks up
         # the phone — the customer sees someone is on it while the AI (and any
@@ -337,6 +341,7 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
                     audio=audio, audio_mime=audio_mime, timeout=_time_left(deadline),
                     hybrid=hybrid, inbox_conversation_id=inbox_conversation_id,
                     exclude_wam_id=message_id if hybrid else None,
+                    awaiting_human=awaiting_human,
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
@@ -429,6 +434,7 @@ def _call_ai_api(
     hybrid: bool = False,
     inbox_conversation_id: int | None = None,
     exclude_wam_id: str | None = None,
+    awaiting_human: bool = False,
 ) -> tuple[str, bool]:
     """
     Call foji-ai-api's internal WhatsApp endpoint.
@@ -459,6 +465,7 @@ def _call_ai_api(
         payload["hybrid"] = True
         payload["inbox_conversation_id"] = inbox_conversation_id
         payload["exclude_wam_id"] = exclude_wam_id
+        payload["awaiting_human"] = awaiting_human
     headers = {"X-Internal-Key": settings.internal_api_key}
 
     # Bounded by the Lambda's remaining time (see _deadline) so a slow answer
