@@ -259,6 +259,33 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
         if deadline is None:
             deadline = time.monotonic() + _DEFAULT_BUDGET_SECONDS
 
+        # Hybrid mode: every message also lands in the team inbox, and the AI
+        # only answers while no person has taken the conversation over.
+        hybrid = (agent.whats_app_mode or "Agent") == "Hybrid"
+        inbox_conversation_id: int | None = None
+        prefetched_audio: tuple[bytes, str] | None = None
+        if hybrid:
+            state, prefetched_audio = _record_for_hybrid(
+                agent,
+                phone_number_id=phone_number_id, sender=sender, profile_name=profile_name,
+                message_id=message_id, text=text, message_type=message_type,
+                media_id=media_id, media_mime=media_mime, media_filename=media_filename,
+                deadline=deadline,
+            )
+            if state is not None:
+                if state.get("duplicate"):
+                    logger.info("Hybrid: %s already handled (webhook retry) — skipping", message_id)
+                    return
+                if state.get("humanTakeover"):
+                    # A person has this conversation. The AI stays out of it, and
+                    # the ticks wait until they open the thread.
+                    logger.info(
+                        "Hybrid: agent_id=%d conversation with %s is with the team — AI quiet",
+                        agent.id, sender,
+                    )
+                    return
+                inbox_conversation_id = state.get("conversationId")
+
         # Blue ticks and "digitando…" straight away, the way a person picks up
         # the phone — the customer sees someone is on it while the AI (and any
         # voice-note transcription) works. Messages we won't answer (a sticker)
@@ -279,10 +306,13 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
         fallback_kind: str | None = None
         if message_type == "audio" and media_id:
             try:
-                audio, fetched_mime = fetch_media(
-                    media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
-                )
-                audio_mime = fetched_mime or media_mime
+                if prefetched_audio:  # hybrid already downloaded it for the inbox
+                    audio, audio_mime = prefetched_audio
+                else:
+                    audio, fetched_mime = fetch_media(
+                        media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
+                    )
+                    audio_mime = fetched_mime or media_mime
                 if len(audio) > _VOICE_MAX_BYTES:
                     audio, fallback_kind = None, "voice_too_long"
             except Exception:
@@ -297,13 +327,16 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
                 )
                 return
 
+        handoff = False
         try:
             if fallback_kind:
                 reply = _fallback_reply(agent, fallback_kind)
             else:
-                reply = _call_ai_api(
+                reply, handoff = _call_ai_api(
                     agent.agent_token, sender, text or "", profile_name,
                     audio=audio, audio_mime=audio_mime, timeout=_time_left(deadline),
+                    hybrid=hybrid, inbox_conversation_id=inbox_conversation_id,
+                    exclude_wam_id=message_id if hybrid else None,
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
@@ -366,6 +399,15 @@ def _process_message(msg: dict, deadline: float | None = None) -> None:
             _flag_needs_reconnect(agent.id)
             raise
 
+        if hybrid:
+            # The team sees exactly what the customer saw.
+            for part in parts:
+                _record_ai_reply(agent.id, sender, part)
+            if handoff:
+                # The AI told the customer someone is coming — now make it true:
+                # hand the conversation to the team and notify them.
+                _escalate(agent.id, sender, text or ("[áudio]" if message_type == "audio" else None))
+
         logger.info(
             "WhatsApp handled: agent_id=%d sender=%s message_id=%s",
             agent.id,
@@ -384,13 +426,18 @@ def _call_ai_api(
     audio: bytes | None = None,
     audio_mime: str | None = None,
     timeout: float = _DEFAULT_BUDGET_SECONDS,
-) -> str:
+    hybrid: bool = False,
+    inbox_conversation_id: int | None = None,
+    exclude_wam_id: str | None = None,
+) -> tuple[str, bool]:
     """
     Call foji-ai-api's internal WhatsApp endpoint.
 
     The AI API handles history lookup, context assembly, and provider
     routing — it returns a plain-text string response (not streamed). A voice
     note travels as base64 and is transcribed there.
+
+    Returns (reply, handoff): in hybrid mode the AI can ask for the team.
     """
     settings = get_settings()
     # foji-ai-api mounts every router under /api/v1 (see its main.py). Without
@@ -408,6 +455,10 @@ def _call_ai_api(
     if audio:
         payload["audio_base64"] = base64.b64encode(audio).decode("ascii")
         payload["audio_mime"] = audio_mime
+    if hybrid:
+        payload["hybrid"] = True
+        payload["inbox_conversation_id"] = inbox_conversation_id
+        payload["exclude_wam_id"] = exclude_wam_id
     headers = {"X-Internal-Key": settings.internal_api_key}
 
     # Bounded by the Lambda's remaining time (see _deadline) so a slow answer
@@ -422,7 +473,7 @@ def _call_ai_api(
     if not reply:
         raise ValueError("AI API returned an empty reply")
 
-    return reply
+    return reply, bool(data.get("handoff"))
 
 
 def _consume_allowance(agent_id: int, category: str = "service") -> bool:
@@ -500,10 +551,102 @@ def _store_media(
     """Download media from Meta and put it in S3. Returns (s3_key, content_type)."""
     content, mime = fetch_media(media_id, token=token)
     content_type = mime or fallback_mime or "application/octet-stream"
+    return _upload_media(company_id, agent_id, media_id, content, content_type), content_type
+
+
+def _upload_media(company_id: int, agent_id: int, media_id: str, content: bytes, content_type: str) -> str:
     extension = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".bin"
     key = f"tenant/{company_id}/whatsapp/{agent_id}/{media_id}{extension}"
     upload_bytes(key, content, content_type)
-    return key, content_type
+    return key
+
+
+def _record_for_hybrid(
+    agent,
+    *,
+    phone_number_id: str,
+    sender: str,
+    profile_name: str | None,
+    message_id: str,
+    text: str | None,
+    message_type: str,
+    media_id: str | None,
+    media_mime: str | None,
+    media_filename: str | None,
+    deadline: float,
+) -> tuple[dict | None, tuple[bytes, str] | None]:
+    """
+    Hybrid mode: put the inbound message in the team inbox before the AI answers.
+
+    Media is downloaded once — the copy goes to S3 for the inbox, and a voice
+    note's bytes are handed back so the AI can transcribe them without a second
+    download. Returns (inbox state, prefetched audio). The state is None if the
+    inbox write failed; the caller then answers anyway rather than leave the
+    customer waiting.
+    """
+    media_key = media_content_type = None
+    audio: tuple[bytes, str] | None = None
+    if media_id:
+        try:
+            content, fetched = fetch_media(
+                media_id, token=_agent_token(agent), timeout=min(15.0, _time_left(deadline))
+            )
+            media_content_type = fetched or media_mime or "application/octet-stream"
+            if message_type == "audio":
+                audio = (content, media_content_type)
+            media_key = _upload_media(agent.company_id, agent.id, media_id, content, media_content_type)
+        except Exception:
+            logger.exception("Hybrid: could not store media %s — recording without it", media_id)
+
+    try:
+        state = _record_inbox_message(
+            agent_id=agent.id,
+            phone_number_id=phone_number_id,
+            wa_id=sender,
+            profile_name=profile_name,
+            wam_id=message_id,
+            text=text or "",
+            message_type=message_type,
+            media_s3_key=media_key,
+            media_content_type=media_content_type,
+            media_filename=media_filename,
+        )
+    except Exception:
+        logger.exception("Hybrid: inbox write failed for %s — answering without it", message_id)
+        state = None
+    return state, audio
+
+
+def _record_ai_reply(agent_id: int, wa_id: str, text: str) -> None:
+    """Hybrid: copy a reply the AI sent into the team inbox. Best-effort — the
+    customer already has the message; only the inbox copy would be missing."""
+    settings = get_settings()
+    try:
+        with httpx.Client(timeout=5) as client:
+            client.post(
+                f"{settings.foji_api_base_url}/api/whatsapp/inbox/internal/ai-reply",
+                json={"agentId": agent_id, "waId": wa_id, "text": text},
+                headers={"X-Internal-Key": settings.internal_api_key},
+            ).raise_for_status()
+    except Exception:
+        logger.exception("Hybrid: could not record the AI reply for agent_id=%d", agent_id)
+
+
+def _escalate(agent_id: int, wa_id: str, customer_message: str | None) -> None:
+    """Hybrid: the AI called the team. FojiApi hands the conversation over (the
+    AI goes quiet in it) and notifies the team."""
+    settings = get_settings()
+    try:
+        with httpx.Client(timeout=8) as client:
+            client.post(
+                f"{settings.foji_api_base_url}/api/whatsapp/inbox/internal/escalate",
+                json={"agentId": agent_id, "waId": wa_id, "customerMessage": customer_message},
+                headers={"X-Internal-Key": settings.internal_api_key},
+            ).raise_for_status()
+    except Exception:
+        # The customer was told someone is coming. If this fails the team isn't
+        # notified — log loudly so it's visible.
+        logger.exception("Hybrid: ESCALATION FAILED for agent_id=%d wa_id=%s", agent_id, wa_id)
 
 
 def _record_inbox_message(
@@ -518,10 +661,13 @@ def _record_inbox_message(
     media_s3_key: str | None = None,
     media_content_type: str | None = None,
     media_filename: str | None = None,
-) -> None:
+) -> dict:
     """
     Store an inbound message in FojiApi's shared inbox. FojiApi owns the Postgres
     schema, so the write goes through its internal endpoint rather than direct SQL.
+
+    Returns {conversationId, duplicate, humanTakeover} — hybrid mode uses it to
+    decide whether the AI may answer.
     """
     settings = get_settings()
     url = f"{settings.foji_api_base_url}/api/whatsapp/inbox/internal/inbound"
@@ -542,3 +688,7 @@ def _record_inbox_message(
     with httpx.Client(timeout=10) as client:
         resp = client.post(url, json=payload, headers=headers)
     resp.raise_for_status()
+    try:
+        return resp.json() if resp.content else {}
+    except ValueError:
+        return {}
