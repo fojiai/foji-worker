@@ -13,7 +13,7 @@ Flow:
   2. Scan DynamoDB for all sessions with messages on that date
      (GSI: date-index on date_partition key)
   3. Aggregate per company:
-       - total_sessions
+       - total_sessions   (conversations started that day — see _aggregate)
        - total_messages
        - total_input_tokens
        - total_output_tokens
@@ -131,17 +131,28 @@ def _aggregate(records: list[dict]) -> dict[int, dict]:
     """
     Aggregate DynamoDB records by company_id.
 
+    "sessions" is the number of CONVERSATIONS that started that day. A session_id
+    is long-lived (a WhatsApp number is "wa:<phone>" forever), so counting
+    distinct session_ids per day counted one customer once per active day. The
+    AI API now marks the exchange that opens a conversation (conversation_start,
+    set after a stretch of inactivity), so each conversation is counted exactly
+    once, on the day it starts — and the monthly cap, a sum of these, follows.
+
+    Items written before that flag existed fall back to the old rule (distinct
+    sessions for the day), so history and the deploy day aren't under-counted.
+
     Returns:
       {
         company_id: {
-          sessions: set → int,
+          sessions: int,
           messages: int,
           input_tokens: int,
           output_tokens: int,
         }
       }
     """
-    session_sets: dict[int, set] = defaultdict(set)
+    conversation_starts: dict[int, int] = defaultdict(int)
+    legacy_sessions: dict[int, set] = defaultdict(set)
     stats: dict[int, dict] = defaultdict(lambda: {
         "sessions": 0,
         "messages": 0,
@@ -154,15 +165,20 @@ def _aggregate(records: list[dict]) -> dict[int, dict]:
         if not company_id:
             continue
 
-        session_id = item.get("session_id", "")
-        session_sets[company_id].add(session_id)
+        started = item.get("conversation_start")
+        if started is None:
+            legacy_sessions[company_id].add(item.get("session_id", ""))
+        elif started:
+            conversation_starts[company_id] += 1
 
         stats[company_id]["messages"] += 1
         stats[company_id]["input_tokens"] += int(item.get("input_tokens", 0))
         stats[company_id]["output_tokens"] += int(item.get("output_tokens", 0))
 
     for company_id in stats:
-        stats[company_id]["sessions"] = len(session_sets[company_id])
+        stats[company_id]["sessions"] = (
+            conversation_starts[company_id] + len(legacy_sessions[company_id])
+        )
 
     return dict(stats)
 
