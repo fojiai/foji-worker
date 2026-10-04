@@ -117,6 +117,10 @@ def _process_file(agent_file_id: int) -> None:
     except Exception as exc:
         logger.exception("Failed to process file_id=%d", agent_file_id)
         try:
+            # A failed statement leaves the transaction aborted; without this
+            # the status update below fails too and the file sits in "Pending"
+            # forever instead of showing the error to the user.
+            db.rollback()
             agent_file = db.get(AgentFile, agent_file_id)
             if agent_file:
                 agent_file.processing_status = "Failed"
